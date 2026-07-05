@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>نظام متابعة الطلاب - مدرسة عزالدين بن الوزير</title>
+<link rel="manifest" href="manifest.json" />
+<meta name="theme-color" content="#0F2C5C" />
+
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://unpkg.com/recharts@2.10.3/umd/Recharts.js"></script>
+
+<style>
+  html, body { margin: 0; padding: 0; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useRef } = React;
+const { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend } = Recharts;
+const XLSX_LIB = window.XLSX;
+
+// أيقونات بديلة بسيطة (بدون مكتبة خارجية) — دوائر ملونة صغيرة تحافظ على وظيفة الأزرار
+function makeIcon(symbol) {
+  return function Icon({ size = 16, color = 'currentColor' }) {
+    return React.createElement('span', {
+      style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: size, height: size, fontSize: size * 0.85, color, lineHeight: 1 }
+    }, symbol);
+  };
+}
+const Lock = makeIcon('🔒');
+const User = makeIcon('👤');
+const LogOut = makeIcon('⏻');
+const Check = makeIcon('✓');
+const X = makeIcon('✕');
+const Clock = makeIcon('🕐');
+const DoorOpen = makeIcon('🚪');
+const MessageSquareWarning = makeIcon('⚠');
+const Printer = makeIcon('🖨');
+const Tv = makeIcon('📺');
+const LayoutDashboard = makeIcon('▦');
+const ChevronLeft = makeIcon('‹');
+const Upload = makeIcon('⬆');
+const Users = makeIcon('👥');
+const Send = makeIcon('➤');
+const LogIn = makeIcon('➜');
+const BookOpen = makeIcon('📖');
+const ClipboardCheck = makeIcon('📋');
+
+/* ========== بداية كود التطبيق ========== */
+
+const PERMIT_TYPES = {
+  enter: { label: 'دخول الفصل', icon: LogIn, color: '#1E4E8C', bg: '#E8EFF9' },
+  exit: { label: 'خروج من الفصل', icon: DoorOpen, color: '#B8860B', bg: '#FBF3E1' },
+  exitSchool: { label: 'خروج من المدرسة مع الكتب', icon: BookOpen, color: '#A33B3B', bg: '#FBEAEA' },
+};
+
+const EXIT_REASONS = ['دورة المياه', 'المقصف', 'الوكيل', 'الموجه الطلابي', 'منسق منصة مدرستي', 'منسق نور', 'رائد النشاط', 'منسق العمل التطوعي', 'المشاركة في نشاط'];
+
+const PERIODS = ['الحصة 1', 'الحصة 2', 'الحصة 3', 'الحصة 4', 'الحصة 5', 'الحصة 6', 'الحصة 7'];
+const CLASSES = ['الأول أ', 'الأول ب', 'الثاني أ', 'الثاني ب', 'الثالث أ'];
+
+const STUDENT_NAMES = [
+  'عبدالله محمد الغامدي', 'سلطان فهد العتيبي', 'خالد سعود القحطاني', 'ناصر عبدالعزيز الدوسري',
+  'فيصل تركي الشهري', 'بندر ماجد الحربي', 'يزيد سلمان المطيري', 'راكان بدر العنزي',
+];
+
+// حسابات معلمين تجريبية (سيُستبدل بربط حقيقي بقاعدة بيانات المدرسة)
+const TEACHERS = [
+  { code: '101', password: '1111', name: 'أ. محمد العتيبي', subject: 'رياضيات' },
+  { code: '102', password: '2222', name: 'أ. سارة القحطاني', subject: 'علوم' },
+];
+const ADMIN = { code: 'admin', password: 'admin', role: 'admin', name: 'مدير المدرسة' };
+const DEPUTY = { code: 'deputy', password: 'deputy', role: 'deputy', name: 'وكيل المرحلة' };
+
+const NOTE_TYPES = [
+  { key: 'late', label: 'تأخر عن الحصة', icon: Clock, color: '#B8860B', bg: '#FBF3E1' },
+  { key: 'left', label: 'خروج بدون إذن', icon: DoorOpen, color: '#A33B3B', bg: '#FBEAEA' },
+  { key: 'noise', label: 'إثارة فوضى', icon: MessageSquareWarning, color: '#8A4B96', bg: '#F3E8F7' },
+];
+
+function makeRoster() {
+  return STUDENT_NAMES.map((name, i) => ({ id: i, name, number: i + 1, status: null, notes: [], phone: `05${(50000000 + i * 137).toString().slice(0, 8)}` }));
+}
+
+// سجل مركزي وهمي: attendance[className][period] = { present, absent, total, notes }
+function seedCentralData() {
+  const data = {};
+  CLASSES.forEach((c, ci) => {
+    data[c] = {};
+    PERIODS.forEach((p, pi) => {
+      const seed = (ci * 3 + pi) % 8;
+      const total = STUDENT_NAMES.length;
+      const absent = seed % 3;
+      const late = (seed + 1) % 2;
+      data[c][p] = { total, present: total - absent, absent, late, done: pi < 3 }; // أول 3 حصص "خلصت" تجريبياً
+    });
+  });
+  return data;
+}
+
+function TeacherApp() {
+  const [session, setSession] = useState(null); // { role: 'teacher'|'admin', teacher? }
+  const [loginCode, setLoginCode] = useState('');
+  const [loginPass, setLoginPass] = useState('');
+  const [loginError, setLoginError] = useState('');
+
+  const [selectedPeriod, setSelectedPeriod] = useState(PERIODS[0]);
+  const [selectedClass, setSelectedClass] = useState(CLASSES[0]);
+  const [roster, setRoster] = useState(makeRoster());
+  const [noteModal, setNoteModal] = useState(null); // { student } for behavior notes
+  const [permitModal, setPermitModal] = useState(null); // { student, step, type } - teacher use
+  const [adminPermitModal, setAdminPermitModal] = useState(null); // { step: 'pick'|'type'|'reason', className, student, type }
+  const [permits, setPermits] = useState([
+    { id: 1, student: 'عبدالله محمد الغامدي', className: 'الأول أ', type: 'exit', reason: 'دورة المياه', teacher: 'أ. محمد العتيبي', time: '09:15', period: 'الحصة 2' },
+    { id: 2, student: 'سلطان فهد العتيبي', className: 'الأول أ', type: 'exitSchool', reason: null, teacher: 'أ. محمد العتيبي', time: '11:40', period: 'الحصة 4' },
+  ]);
+  const [toast, setToast] = useState(null);
+  const [reportLabel, setReportLabel] = useState('اليوم');
+  const [printType, setPrintType] = useState(null);
+  const [printSinglePermit, setPrintSinglePermit] = useState(null);
+  const [adminView, setAdminView] = useState('dashboard'); // 'dashboard' | 'live' | 'students' | 'permits' | 'users'
+  const [userAccounts, setUserAccounts] = useState([
+    { id: 1, name: 'أ. محمد العتيبي', code: '101', password: '1111', role: 'teacher', subject: 'رياضيات', active: true },
+    { id: 2, name: 'أ. سارة القحطاني', code: '102', password: '2222', role: 'teacher', subject: 'علوم', active: true },
+    { id: 3, name: 'وكيل المرحلة', code: 'deputy', password: 'deputy', role: 'deputy', subject: '—', active: true },
+  ]);
+  const [userModal, setUserModal] = useState(null); // { mode: 'add'|'edit', data }
+  const [central] = useState(seedCentralData());
+  const [studentDirectory, setStudentDirectory] = useState(() =>
+    CLASSES.flatMap(c => makeRoster().map(s => ({ ...s, className: c, id: `${c}-${s.id}` })))
+  );
+  const [uploadMsg, setUploadMsg] = useState('');
+  const fileInputRef = useRef(null);
+
+  // قائمة تجريبية لأحداث اليوم اللي تحتاج إشعار (غياب/ملاحظات) بانتظار إرسال وكيل المرحلة
+  const [pendingMessages, setPendingMessages] = useState([
+    { id: 1, student: 'عبدالله محمد الغامدي', className: 'الأول أ', reason: 'غياب اليوم', sent: false },
+    { id: 2, student: 'خالد سعود القحطاني', className: 'الأول أ', reason: 'تأخر عن الحصة 2', sent: false },
+    { id: 3, student: 'فيصل تركي الشهري', className: 'الثاني أ', reason: 'خروج بدون إذن', sent: false },
+  ]);
+
+  const handleFileUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const wb = XLSX.read(evt.target.result, { type: 'binary' });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(sheet, { header: ['name', 'phone', 'className'], range: 1 });
+        const imported = rows.filter(r => r.name).map((r, i) => ({
+          id: `import-${Date.now()}-${i}`,
+          name: String(r.name).trim(),
+          phone: r.phone ? String(r.phone).trim() : '—',
+          className: r.className ? String(r.className).trim() : CLASSES[0],
+          number: i + 1,
+        }));
+        setStudentDirectory(prev => [...prev, ...imported]);
+        setUploadMsg(`تم استيراد ${imported.length} طالب بنجاح`);
+      } catch (err) {
+        setUploadMsg('حدث خطأ في قراءة الملف — تأكد من الصيغة (اسم، جوال، فصل)');
+      }
+      setTimeout(() => setUploadMsg(''), 4000);
+    };
+    reader.readAsBinaryString(file);
+  };
+
+  const sendMessage = (id) => {
+    setPendingMessages(prev => prev.map(m => m.id === id ? { ...m, sent: true } : m));
+  };
+  const sendAllMessages = () => {
+    setPendingMessages(prev => prev.map(m => ({ ...m, sent: true })));
+  };
+
+  const chartData = useMemo(() => {
+    return CLASSES.map(c => {
+      const donePeriods = PERIODS.filter(p => central[c][p].done);
+      const present = donePeriods.reduce((a, p) => a + central[c][p].present, 0);
+      const absent = donePeriods.reduce((a, p) => a + central[c][p].absent, 0);
+      return { name: c, حاضر: present, غائب: absent };
+    });
+  }, [central]);
+
+  const teacherPermitStats = useMemo(() => {
+    const counts = {};
+    permits.forEach(p => { counts[p.teacher] = (counts[p.teacher] || 0) + 1; });
+    return Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  }, [permits]);
+
+  const permitsByType = useMemo(() => ({
+    enter: permits.filter(p => p.type === 'enter'),
+    exit: permits.filter(p => p.type === 'exit'),
+    exitSchool: permits.filter(p => p.type === 'exitSchool'),
+  }), [permits]);
+
+  const handleLogin = () => {
+    if (loginCode === ADMIN.code && loginPass === ADMIN.password) {
+      setSession({ role: 'admin', name: ADMIN.name });
+      setLoginError('');
+      return;
+    }
+    const u = userAccounts.find(u => u.code === loginCode && u.password === loginPass && u.active);
+    if (u) {
+      if (u.role === 'deputy') {
+        setSession({ role: 'deputy', name: u.name });
+      } else {
+        setSession({ role: 'teacher', teacher: u });
+      }
+      setLoginError('');
+    } else {
+      setLoginError('كود المستخدم أو كلمة المرور غير صحيحة، أو الحساب معطّل');
+    }
+  };
+
+  const setStatus = (id, status) => {
+    setRoster(prev => prev.map(s => s.id === id ? { ...s, status } : s));
+  };
+
+  const addNote = (studentId, noteKey) => {
+    setRoster(prev => prev.map(s => s.id === studentId ? { ...s, notes: [...s.notes, noteKey] } : s));
+    setNoteModal(null);
+    setToast('تم تسجيل الملاحظة بنجاح');
+    setTimeout(() => setToast(null), 2000);
+  };
+
+  const createPermit = (student, type, reason) => {
+    const now = new Date();
+    const time = now.toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
+    setPermits(prev => [{
+      id: Date.now(), student: student.name, className: selectedClass, type, reason: reason || null,
+      teacher: session.teacher.name, time, period: selectedPeriod,
+    }, ...prev]);
+    setPermitModal(null);
+    setToast('تم تسجيل الاستئذان — ظاهر الآن عند الوكيل والإدارة');
+    setTimeout(() => setToast(null), 2400);
+  };
+
+  const createAdminPermit = (studentName, className, type, reason) => {
+    const now = new Date();
+    const time = now.toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
+    setPermits(prev => [{
+      id: Date.now(), student: studentName, className, type, reason: reason || null,
+      teacher: session.name, time, period: '—',
+    }, ...prev]);
+    setAdminPermitModal(null);
+    setToast('تم تسجيل الاستئذان بنجاح');
+    setTimeout(() => setToast(null), 2400);
+  };
+
+  const stats = useMemo(() => {
+    const present = roster.filter(s => s.status === 'present').length;
+    const absent = roster.filter(s => s.status === 'absent').length;
+    const marked = roster.filter(s => s.status).length;
+    return { present, absent, marked, total: roster.length };
+  }, [roster]);
+
+  // ----------------- شاشة تسجيل الدخول -----------------
+  if (!session) {
+    return (
+      <div dir="rtl" style={{ fontFamily: "'Segoe UI', Tahoma, Arial, sans-serif", background: '#0F2C5C', minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
+        <div style={{ background: '#fff', borderRadius: 18, padding: 32, width: '100%', maxWidth: 380, boxShadow: '0 20px 50px rgba(0,0,0,0.25)' }}>
+          <div style={{ textAlign: 'center', marginBottom: 24 }}>
+            <div style={{ fontSize: 14, fontWeight: 900, color: '#C9A227' }}>مدرسة عزالدين بن الوزير</div>
+            <div style={{ fontSize: 20, fontWeight: 900, color: '#0F2C5C', marginTop: 4 }}>تسجيل دخول المعلمين</div>
+          </div>
+
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ fontSize: 13, fontWeight: 700, color: '#5A5F55', display: 'block', marginBottom: 6 }}>كود المعلم</label>
+            <div style={{ position: 'relative' }}>
+              <User size={16} style={{ position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)', color: '#8A8F84' }} />
+              <input value={loginCode} onChange={e => setLoginCode(e.target.value)} placeholder="مثال: 101"
+                style={{ width: '100%', padding: '11px 38px 11px 12px', borderRadius: 10, border: '1px solid #DEDBD2', fontSize: 14 }} />
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 18 }}>
+            <label style={{ fontSize: 13, fontWeight: 700, color: '#5A5F55', display: 'block', marginBottom: 6 }}>كلمة المرور</label>
+            <div style={{ position: 'relative' }}>
+              <Lock size={16} style={{ position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)', color: '#8A8F84' }} />
+              <input type="password" value={loginPass} onChange={e => setLoginPass(e.target.value)}
+                style={{ width: '100%', padding: '11px 38px 11px 12px', borderRadius: 10, border: '1px solid #DEDBD2', fontSize: 14 }} />
+            </div>
+          </div>
+
+          {loginError && <div style={{ color: '#A33B3B', fontSize: 13, marginBottom: 12, textAlign: 'center' }}>{loginError}</div>}
+
+          <button onClick={handleLogin} style={{ width: '100%', padding: 13, borderRadius: 10, border: 'none', background: '#0F2C5C', color: '#fff', fontWeight: 800, fontSize: 15 }}>
+            دخول
+          </button>
+
+          <div style={{ marginTop: 18, fontSize: 11.5, color: '#8A8F84', textAlign: 'center', lineHeight: 1.7 }}>
+            للتجربة: كود معلم 101 / كلمة مرور 1111 <br/> وكيل المرحلة: deputy / deputy <br/> مدير المدرسة: admin / admin
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ----------------- لوحة الإدارة -----------------
+  if (session.role === 'admin' || session.role === 'deputy') {
+    return (
+      <div dir="rtl" style={{ fontFamily: "'Segoe UI', Tahoma, Arial, sans-serif", background: '#F7F5F1', minHeight: '100vh' }}>
+        <style>{`
+          * { box-sizing: border-box; }
+          button { font-family: inherit; cursor: pointer; }
+          .print-only { display: none; }
+          @media print {
+            .screen-only { display: none !important; }
+            .print-only { display: block !important; }
+            body { background: #fff !important; }
+          }
+        `}</style>
+        <header className="screen-only" style={{ background: '#0F2C5C', color: '#fff', padding: '16px 24px', borderBottom: '3px solid #C9A227', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
+          <div>
+            <div style={{ fontSize: 12, color: '#C9A227', fontWeight: 700 }}>مدرسة عزالدين بن الوزير</div>
+            <div style={{ fontSize: 18, fontWeight: 900 }}>{session.name} {session.role === 'deputy' ? '— وكيل المرحلة' : ''}</div>
+          </div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button onClick={() => setAdminView('dashboard')} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '9px 14px', borderRadius: 9, border: 'none', background: adminView === 'dashboard' ? '#C9A227' : 'rgba(255,255,255,0.15)', color: adminView === 'dashboard' ? '#0F2C5C' : '#fff', fontWeight: 700, fontSize: 13 }}>
+              <LayoutDashboard size={15} /> لوحة التحكم
+            </button>
+            <button onClick={() => setAdminView('live')} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '9px 14px', borderRadius: 9, border: 'none', background: adminView === 'live' ? '#C9A227' : 'rgba(255,255,255,0.15)', color: adminView === 'live' ? '#0F2C5C' : '#fff', fontWeight: 700, fontSize: 13 }}>
+              <Tv size={15} /> الشاشة الحية
+            </button>
+            <button onClick={() => setAdminView('students')} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '9px 14px', borderRadius: 9, border: 'none', background: adminView === 'students' ? '#C9A227' : 'rgba(255,255,255,0.15)', color: adminView === 'students' ? '#0F2C5C' : '#fff', fontWeight: 700, fontSize: 13 }}>
+              <Users size={15} /> إدارة الطلاب وواتساب
+            </button>
+            <button onClick={() => setAdminView('permits')} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '9px 14px', borderRadius: 9, border: 'none', background: adminView === 'permits' ? '#C9A227' : 'rgba(255,255,255,0.15)', color: adminView === 'permits' ? '#0F2C5C' : '#fff', fontWeight: 700, fontSize: 13 }}>
+              <ClipboardCheck size={15} /> الاستئذانات
+            </button>
+            {session.role === 'admin' && (
+              <button onClick={() => setAdminView('users')} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '9px 14px', borderRadius: 9, border: 'none', background: adminView === 'users' ? '#C9A227' : 'rgba(255,255,255,0.15)', color: adminView === 'users' ? '#0F2C5C' : '#fff', fontWeight: 700, fontSize: 13 }}>
+                <User size={15} /> إدارة المستخدمين
+              </button>
+            )}
+            <button onClick={() => setSession(null)} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '9px 14px', borderRadius: 9, border: 'none', background: 'rgba(255,255,255,0.15)', color: '#fff', fontWeight: 700, fontSize: 13 }}>
+              <LogOut size={15} /> خروج
+            </button>
+          </div>
+        </header>
+
+        {adminView === 'dashboard' ? (
+          <>
+          <main className="screen-only" style={{ maxWidth: 1100, margin: '0 auto', padding: '24px 20px 60px' }}>
+
+            <div style={{ background: '#fff', borderRadius: 14, border: '1px solid #EAE7DE', padding: '18px 12px', marginBottom: 20 }}>
+              <div style={{ fontSize: 14, fontWeight: 800, color: '#0F2C5C', marginBottom: 10, paddingRight: 8 }}>مقارنة الحضور والغياب لكل فصل (تراكمي لليوم)</div>
+              <ResponsiveContainer width="100%" height={240}>
+                <BarChart data={chartData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#EAE7DE" />
+                  <XAxis dataKey="name" tick={{ fontSize: 12, fill: '#5A5F55' }} />
+                  <YAxis tick={{ fontSize: 12, fill: '#5A5F55' }} />
+                  <Tooltip contentStyle={{ fontFamily: 'inherit', borderRadius: 8, border: '1px solid #EAE7DE' }} />
+                  <Legend wrapperStyle={{ fontSize: 12 }} />
+                  <Bar dataKey="حاضر" fill="#1E4E8C" radius={[6, 6, 0, 0]} />
+                  <Bar dataKey="غائب" fill="#A33B3B" radius={[6, 6, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 10 }}>
+              <h2 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: '#0F2C5C' }}>متابعة الحضور حسب الفصل والحصة</h2>
+              <div style={{ display: 'flex', gap: 8 }}>
+                {['اليوم', 'الأسبوع', 'الشهر'].map(p => (
+                  <button key={p} onClick={() => { setReportLabel(p); setTimeout(() => window.print(), 50); }} style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '8px 14px', borderRadius: 8, border: '1px solid #DEDBD2', background: '#fff', fontSize: 12.5, fontWeight: 700, color: '#0F2C5C' }}>
+                    <Printer size={13} /> تقرير {p}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ background: '#fff', borderRadius: 14, border: '1px solid #EAE7DE', overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 700 }}>
+                <thead>
+                  <tr>
+                    <th style={{ padding: 12, textAlign: 'right', background: '#0F2C5C', color: '#fff', fontSize: 13, position: 'sticky', right: 0 }}>الفصل</th>
+                    {PERIODS.map(p => <th key={p} style={{ padding: 10, background: '#0F2C5C', color: '#fff', fontSize: 12, minWidth: 84 }}>{p}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {CLASSES.map((c, ci) => (
+                    <tr key={c} style={{ borderBottom: '1px solid #F0EEE6' }}>
+                      <td style={{ padding: 12, fontWeight: 700, fontSize: 13.5, background: '#fff', position: 'sticky', right: 0 }}>{c}</td>
+                      {PERIODS.map(p => {
+                        const d = central[c][p];
+                        const bg = !d.done ? '#F5F4EF' : d.absent > 1 ? '#FBEAEA' : '#E8EFF9';
+                        const color = !d.done ? '#8A8F84' : d.absent > 1 ? '#A33B3B' : '#1E4E8C';
+                        return (
+                          <td key={p} style={{ padding: 8, textAlign: 'center' }}>
+                            <div style={{ background: bg, color, borderRadius: 8, padding: '6px 4px', fontSize: 12, fontWeight: 700 }}>
+                              {d.done ? `${d.present}/${d.total}` : '—'}
+                            </div>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div style={{ fontSize: 12, color: '#8A8F84', marginTop: 10 }}>الأرقام الملونة بالأزرق = حضور طبيعي، بالأحمر = غياب مرتفع يحتاج متابعة، "—" = الحصة لم تُحضَّر بعد.</div>
+          </main>
+
+          {/* تقرير قابل للطباعة فقط */}
+          <div className="print-only" style={{ padding: 24, fontFamily: 'Arial, sans-serif', color: '#0F2C5C' }}>
+            <div style={{ textAlign: 'center', fontWeight: 900, fontSize: 18 }}>مدرسة عزالدين بن الوزير</div>
+            <h1 style={{ fontSize: 17, borderBottom: '3px solid #C9A227', paddingBottom: 8, textAlign: 'center' }}>تقرير الحضور والغياب — {reportLabel}</h1>
+            <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 14 }}>
+              <thead>
+                <tr>
+                  <th style={{ background: '#0F2C5C', color: '#fff', padding: 8, border: '1px solid #ccc' }}>الفصل</th>
+                  {PERIODS.map(p => <th key={p} style={{ background: '#0F2C5C', color: '#fff', padding: 6, border: '1px solid #ccc', fontSize: 11 }}>{p}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {CLASSES.map(c => (
+                  <tr key={c}>
+                    <td style={{ padding: 8, border: '1px solid #ccc', fontWeight: 'bold' }}>{c}</td>
+                    {PERIODS.map(p => {
+                      const d = central[c][p];
+                      return <td key={p} style={{ padding: 6, border: '1px solid #ccc', textAlign: 'center' }}>{d.done ? `${d.present}/${d.total}` : '—'}</td>;
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          </>
+        ) : adminView === 'live' ? (
+          <main className="screen-only" style={{ padding: '30px 24px' }}>
+            <div style={{ textAlign: 'center', marginBottom: 24 }}>
+              <div style={{ fontSize: 16, color: '#C9A227', fontWeight: 800 }}>مدرسة عزالدين بن الوزير — شاشة المتابعة اللحظية</div>
+              <div style={{ fontSize: 13, color: '#8A8F84' }}>تتحدث تلقائياً مع كل تحضير من المعلمين</div>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16, maxWidth: 1100, margin: '0 auto' }}>
+              {CLASSES.map(c => {
+                const periodsDone = PERIODS.filter(p => central[c][p].done);
+                const last = periodsDone[periodsDone.length - 1];
+                const d = last ? central[c][last] : null;
+                return (
+                  <div key={c} style={{ background: '#0F2C5C', borderRadius: 16, padding: 20, color: '#fff', border: '2px solid #C9A227' }}>
+                    <div style={{ fontSize: 16, fontWeight: 900, marginBottom: 10 }}>{c}</div>
+                    {d ? (
+                      <>
+                        <div style={{ fontSize: 12, color: '#BFD1EF', marginBottom: 6 }}>آخر تحديث: {last}</div>
+                        <div style={{ display: 'flex', gap: 12 }}>
+                          <div><div style={{ fontSize: 24, fontWeight: 900, color: '#7FE0A0' }}>{d.present}</div><div style={{ fontSize: 11, color: '#BFD1EF' }}>حاضر</div></div>
+                          <div><div style={{ fontSize: 24, fontWeight: 900, color: '#F4A0A0' }}>{d.absent}</div><div style={{ fontSize: 11, color: '#BFD1EF' }}>غائب</div></div>
+                        </div>
+                      </>
+                    ) : <div style={{ fontSize: 12, color: '#BFD1EF' }}>لا يوجد تحضير بعد اليوم</div>}
+                  </div>
+                );
+              })}
+            </div>
+          </main>
+        ) : adminView === 'students' ? (
+          <main className="screen-only" style={{ maxWidth: 900, margin: '0 auto', padding: '24px 20px 60px' }}>
+
+            {/* رفع الطلاب */}
+            <div style={{ background: '#fff', borderRadius: 14, border: '1px solid #EAE7DE', padding: 20, marginBottom: 20 }}>
+              <div style={{ fontSize: 15, fontWeight: 800, color: '#0F2C5C', marginBottom: 6 }}>رفع أسماء الطلاب وأرقام الجوال</div>
+              <div style={{ fontSize: 12.5, color: '#8A8F84', marginBottom: 14 }}>
+                ارفع ملف Excel بثلاثة أعمدة بهذا الترتيب: <b>الاسم</b> | <b>رقم الجوال</b> | <b>الفصل</b> (الصف الأول عنوان الأعمدة).
+              </div>
+              <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.csv" onChange={handleFileUpload} style={{ display: 'none' }} />
+              <button onClick={() => fileInputRef.current.click()} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '11px 20px', borderRadius: 10, border: 'none', background: '#0F2C5C', color: '#fff', fontWeight: 700, fontSize: 14 }}>
+                <Upload size={16} /> اختيار ملف Excel
+              </button>
+              {uploadMsg && <div style={{ marginTop: 10, fontSize: 13, color: '#1E4E8C', fontWeight: 700 }}>{uploadMsg}</div>}
+              <div style={{ marginTop: 14, fontSize: 12.5, color: '#5A5F55' }}>
+                إجمالي الطلاب المسجلين حالياً: <b>{studentDirectory.length}</b> طالب
+              </div>
+            </div>
+
+            {/* إرسال واتساب */}
+            <div style={{ background: '#fff', borderRadius: 14, border: '1px solid #EAE7DE', padding: 20 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, flexWrap: 'wrap', gap: 8 }}>
+                <div style={{ fontSize: 15, fontWeight: 800, color: '#0F2C5C' }}>إشعارات واتساب المعلقة (اليوم)</div>
+                <button onClick={sendAllMessages} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '9px 16px', borderRadius: 9, border: 'none', background: '#25D366', color: '#fff', fontWeight: 700, fontSize: 13 }}>
+                  <Send size={14} /> إرسال الكل
+                </button>
+              </div>
+              <div style={{ fontSize: 12, color: '#8A8F84', marginBottom: 12 }}>
+                هذه القائمة تُجمَّع تلقائياً من ملاحظات وغياب المعلمين، وإرسالها الفعلي لولي الأمر يكون حصراً من هنا (وكيل المرحلة / الإدارة) — المعلم لا يملك صلاحية الإرسال.
+              </div>
+              {pendingMessages.map(m => (
+                <div key={m.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 0', borderTop: '1px solid #F0EEE6' }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: 700, fontSize: 13.5 }}>{m.student} <span style={{ color: '#8A8F84', fontWeight: 500 }}>— {m.className}</span></div>
+                    <div style={{ fontSize: 12, color: '#A33B3B' }}>{m.reason}</div>
+                  </div>
+                  {m.sent ? (
+                    <span style={{ fontSize: 12, color: '#1E4E8C', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 4 }}><Check size={13} /> تم الإرسال</span>
+                  ) : (
+                    <button onClick={() => sendMessage(m.id)} style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '7px 14px', borderRadius: 8, border: 'none', background: '#E8F9EF', color: '#25D366', fontWeight: 700, fontSize: 12.5 }}>
+                      <Send size={12} /> إرسال
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          </main>
+        ) : adminView === 'permits' ? (
+          <>
+          <main className="screen-only" style={{ maxWidth: 900, margin: '0 auto', padding: '24px 20px 60px' }}>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 16 }}>
+              <button onClick={() => setAdminPermitModal({ step: 'pick', className: CLASSES[0] })} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '10px 18px', borderRadius: 10, border: 'none', background: '#B8860B', color: '#fff', fontWeight: 700, fontSize: 13.5 }}>
+                <ClipboardCheck size={15} /> تسجيل استئذان جديد
+              </button>
+            </div>
+
+            {/* إحصائية المعلمين */}
+            <div style={{ background: '#fff', borderRadius: 14, border: '1px solid #EAE7DE', padding: 20, marginBottom: 20 }}>
+              <div style={{ fontSize: 15, fontWeight: 800, color: '#0F2C5C', marginBottom: 12 }}>عدد مرات إخراج الطلاب للاستئذان لكل معلم</div>
+              {teacherPermitStats.length === 0 && <div style={{ fontSize: 13, color: '#8A8F84' }}>لا توجد بيانات بعد</div>}
+              {teacherPermitStats.map(([teacher, count]) => (
+                <div key={teacher} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '9px 0', borderTop: '1px solid #F0EEE6' }}>
+                  <span style={{ fontSize: 13.5, fontWeight: 700 }}>{teacher}</span>
+                  <span style={{ fontSize: 13, fontWeight: 900, color: count >= 3 ? '#A33B3B' : '#1E4E8C', background: count >= 3 ? '#FBEAEA' : '#E8EFF9', padding: '3px 12px', borderRadius: 8 }}>{count} مرة</span>
+                </div>
+              ))}
+            </div>
+
+            {/* الأقسام الثلاثة منفصلة */}
+            {Object.entries(PERMIT_TYPES).map(([typeKey, cfg]) => (
+              <div key={typeKey} style={{ background: '#fff', borderRadius: 14, border: '1px solid #EAE7DE', padding: 20, marginBottom: 16 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <cfg.icon size={17} color={cfg.color} />
+                    <span style={{ fontSize: 15, fontWeight: 800, color: cfg.color }}>{cfg.label}</span>
+                    <span style={{ fontSize: 12, color: '#8A8F84' }}>({permitsByType[typeKey].length})</span>
+                  </div>
+                  <button onClick={() => { setPrintType(typeKey); setTimeout(() => window.print(), 50); }} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 14px', borderRadius: 8, border: 'none', background: '#0F2C5C', color: '#fff', fontWeight: 700, fontSize: 12.5 }}>
+                    <Printer size={13} /> طباعة الكل
+                  </button>
+                </div>
+                {permitsByType[typeKey].length === 0 && <div style={{ fontSize: 12.5, color: '#8A8F84', padding: '10px 0' }}>لا يوجد سجل اليوم</div>}
+                {permitsByType[typeKey].map(p => (
+                  <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 0', borderTop: '1px solid #F0EEE6' }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontWeight: 700, fontSize: 13.5 }}>{p.student} <span style={{ color: '#8A8F84', fontWeight: 500 }}>— {p.className}</span></div>
+                      {p.reason && <div style={{ fontSize: 12, color: cfg.color, fontWeight: 700 }}>{p.reason}</div>}
+                      <div style={{ fontSize: 11, color: '#8A8F84' }}>{p.teacher} • {p.period} • الساعة {p.time}</div>
+                    </div>
+                    <button onClick={() => { setPrintSinglePermit(p); setTimeout(() => window.print(), 50); }} title="طباعة فاتورة هذا الاستئذان" style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '7px 12px', borderRadius: 8, border: '1px solid #E2DFD6', background: '#fff', color: '#0F2C5C', fontWeight: 700, fontSize: 12 }}>
+                      <Printer size={13} /> فاتورة
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </main>
+
+          {/* طباعة قائمة نوع استئذان معين */}
+          {printType && (
+            <div className="print-only" style={{ padding: 24, fontFamily: 'Arial, sans-serif', color: '#0F2C5C' }}>
+              <div style={{ textAlign: 'center', fontWeight: 900, fontSize: 18 }}>مدرسة عزالدين بن الوزير</div>
+              <h1 style={{ fontSize: 17, borderBottom: '3px solid #C9A227', paddingBottom: 8, textAlign: 'center' }}>تقرير {PERMIT_TYPES[printType].label}</h1>
+              <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 14 }}>
+                <thead>
+                  <tr>
+                    <th style={{ background: '#0F2C5C', color: '#fff', padding: 8, border: '1px solid #ccc' }}>الطالب</th>
+                    <th style={{ background: '#0F2C5C', color: '#fff', padding: 8, border: '1px solid #ccc' }}>الفصل</th>
+                    <th style={{ background: '#0F2C5C', color: '#fff', padding: 8, border: '1px solid #ccc' }}>السبب</th>
+                    <th style={{ background: '#0F2C5C', color: '#fff', padding: 8, border: '1px solid #ccc' }}>المعلم/المسجِّل</th>
+                    <th style={{ background: '#0F2C5C', color: '#fff', padding: 8, border: '1px solid #ccc' }}>الوقت</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {permitsByType[printType].map(p => (
+                    <tr key={p.id}>
+                      <td style={{ padding: 8, border: '1px solid #ccc' }}>{p.student}</td>
+                      <td style={{ padding: 8, border: '1px solid #ccc' }}>{p.className}</td>
+                      <td style={{ padding: 8, border: '1px solid #ccc' }}>{p.reason || '-'}</td>
+                      <td style={{ padding: 8, border: '1px solid #ccc' }}>{p.teacher}</td>
+                      <td style={{ padding: 8, border: '1px solid #ccc' }}>{p.time}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* طباعة فاتورة استئذان فردية */}
+          {printSinglePermit && (
+            <div className="print-only" style={{ padding: 40, fontFamily: 'Arial, sans-serif', color: '#0F2C5C', maxWidth: 500, margin: '0 auto' }}>
+              <div style={{ textAlign: 'center', fontWeight: 900, fontSize: 18, marginBottom: 4 }}>مدرسة عزالدين بن الوزير</div>
+              <div style={{ textAlign: 'center', fontSize: 14, color: '#C9A227', fontWeight: 700, marginBottom: 20 }}>فاتورة استئذان</div>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 14 }}>
+                <tbody>
+                  <tr><td style={{ padding: 10, border: '1px solid #ccc', fontWeight: 'bold', width: '40%' }}>اسم الطالب</td><td style={{ padding: 10, border: '1px solid #ccc' }}>{printSinglePermit.student}</td></tr>
+                  <tr><td style={{ padding: 10, border: '1px solid #ccc', fontWeight: 'bold' }}>الفصل</td><td style={{ padding: 10, border: '1px solid #ccc' }}>{printSinglePermit.className}</td></tr>
+                  <tr><td style={{ padding: 10, border: '1px solid #ccc', fontWeight: 'bold' }}>نوع الاستئذان</td><td style={{ padding: 10, border: '1px solid #ccc' }}>{PERMIT_TYPES[printSinglePermit.type].label}</td></tr>
+                  {printSinglePermit.reason && <tr><td style={{ padding: 10, border: '1px solid #ccc', fontWeight: 'bold' }}>السبب</td><td style={{ padding: 10, border: '1px solid #ccc' }}>{printSinglePermit.reason}</td></tr>}
+                  <tr><td style={{ padding: 10, border: '1px solid #ccc', fontWeight: 'bold' }}>المعلم/المسجِّل</td><td style={{ padding: 10, border: '1px solid #ccc' }}>{printSinglePermit.teacher}</td></tr>
+                  <tr><td style={{ padding: 10, border: '1px solid #ccc', fontWeight: 'bold' }}>الحصة</td><td style={{ padding: 10, border: '1px solid #ccc' }}>{printSinglePermit.period}</td></tr>
+                  <tr><td style={{ padding: 10, border: '1px solid #ccc', fontWeight: 'bold' }}>الوقت</td><td style={{ padding: 10, border: '1px solid #ccc' }}>{printSinglePermit.time}</td></tr>
+                </tbody>
+              </table>
+              <div style={{ marginTop: 40, display: 'flex', justifyContent: 'space-between', fontSize: 13 }}>
+                <div>توقيع المعلم: ______________</div>
+                <div>توقيع الوكيل: ______________</div>
+              </div>
+            </div>
+          )}
+          </>
+        ) : (
+          <main className="screen-only" style={{ maxWidth: 900, margin: '0 auto', padding: '24px 20px 60px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <div style={{ fontSize: 15, fontWeight: 800, color: '#0F2C5C' }}>إدارة حسابات المستخدمين</div>
+              <button onClick={() => setUserModal({ mode: 'add', data: { name: '', code: '', password: '', role: 'teacher', subject: '', active: true } })}
+                style={{ padding: '9px 16px', borderRadius: 9, border: 'none', background: '#0F2C5C', color: '#fff', fontWeight: 700, fontSize: 13 }}>
+                + إضافة مستخدم جديد
+              </button>
+            </div>
+
+            <div style={{ background: '#fff', borderRadius: 14, border: '1px solid #EAE7DE', overflow: 'hidden' }}>
+              {userAccounts.map((u, i) => (
+                <div key={u.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '14px 18px', borderBottom: i !== userAccounts.length - 1 ? '1px solid #F0EEE6' : 'none', opacity: u.active ? 1 : 0.5 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 700, fontSize: 14 }}>{u.name}</div>
+                    <div style={{ fontSize: 12, color: '#8A8F84' }}>
+                      كود: {u.code} • الدور: {u.role === 'teacher' ? `معلم (${u.subject})` : 'وكيل المرحلة'} {!u.active && '• معطّل'}
+                    </div>
+                  </div>
+                  <button onClick={() => setUserModal({ mode: 'edit', data: { ...u } })}
+                    style={{ padding: '7px 12px', borderRadius: 8, border: '1px solid #E2DFD6', background: '#fff', color: '#0F2C5C', fontWeight: 700, fontSize: 12 }}>
+                    تعديل
+                  </button>
+                  <button onClick={() => setUserAccounts(prev => prev.map(x => x.id === u.id ? { ...x, active: !x.active } : x))}
+                    style={{ padding: '7px 12px', borderRadius: 8, border: '1px solid #E2DFD6', background: u.active ? '#FBEAEA' : '#E8F9EF', color: u.active ? '#A33B3B' : '#1E4E8C', fontWeight: 700, fontSize: 12 }}>
+                    {u.active ? 'تعطيل' : 'تفعيل'}
+                  </button>
+                  <button onClick={() => setUserAccounts(prev => prev.filter(x => x.id !== u.id))}
+                    style={{ padding: '7px 12px', borderRadius: 8, border: '1px solid #E2DFD6', background: '#fff', color: '#A33B3B', fontWeight: 700, fontSize: 12 }}>
+                    حذف
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ fontSize: 12, color: '#8A8F84', marginTop: 12 }}>
+              ملاحظة: حساب المدير (admin) ثابت ولا يظهر هنا لأنه أعلى صلاحية في النظام. كل حساب جديد تضيفه هنا يقدر يدخل فوراً بنفس الكود وكلمة المرور اللي تحددها له.
+            </div>
+          </main>
+        )}
+
+        {/* User account add/edit modal */}
+        {userModal && (
+          <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,44,92,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16, zIndex: 50 }}>
+            <div style={{ background: '#fff', borderRadius: 16, maxWidth: 400, width: '100%', maxHeight: '85vh', overflowY: 'auto', padding: 22 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+                <div style={{ fontWeight: 800, fontSize: 15, color: '#0F2C5C' }}>{userModal.mode === 'add' ? 'إضافة مستخدم جديد' : 'تعديل بيانات المستخدم'}</div>
+                <button onClick={() => setUserModal(null)} style={{ border: 'none', background: 'none' }}><X size={18} /></button>
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div>
+                  <label style={{ fontSize: 12.5, fontWeight: 700, color: '#5A5F55', display: 'block', marginBottom: 5 }}>الاسم الكامل</label>
+                  <input value={userModal.data.name} onChange={e => setUserModal({ ...userModal, data: { ...userModal.data, name: e.target.value } })}
+                    style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid #DEDBD2', fontSize: 13.5 }} />
+                </div>
+
+                <div>
+                  <label style={{ fontSize: 12.5, fontWeight: 700, color: '#5A5F55', display: 'block', marginBottom: 5 }}>الدور / الصلاحية</label>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    {[{ key: 'teacher', label: 'معلم' }, { key: 'deputy', label: 'وكيل مرحلة' }].map(r => (
+                      <button key={r.key} onClick={() => setUserModal({ ...userModal, data: { ...userModal.data, role: r.key } })}
+                        style={{ flex: 1, padding: 9, borderRadius: 8, border: userModal.data.role === r.key ? '2px solid #0F2C5C' : '1px solid #DEDBD2', background: userModal.data.role === r.key ? '#E8EFF9' : '#fff', color: userModal.data.role === r.key ? '#0F2C5C' : '#5A5F55', fontWeight: 700, fontSize: 13 }}>
+                        {r.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {userModal.data.role === 'teacher' && (
+                  <div>
+                    <label style={{ fontSize: 12.5, fontWeight: 700, color: '#5A5F55', display: 'block', marginBottom: 5 }}>المادة الدراسية</label>
+                    <input value={userModal.data.subject} onChange={e => setUserModal({ ...userModal, data: { ...userModal.data, subject: e.target.value } })}
+                      style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid #DEDBD2', fontSize: 13.5 }} />
+                  </div>
+                )}
+
+                <div>
+                  <label style={{ fontSize: 12.5, fontWeight: 700, color: '#5A5F55', display: 'block', marginBottom: 5 }}>كود الدخول (اسم المستخدم)</label>
+                  <input value={userModal.data.code} onChange={e => setUserModal({ ...userModal, data: { ...userModal.data, code: e.target.value } })}
+                    style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid #DEDBD2', fontSize: 13.5 }} />
+                </div>
+
+                <div>
+                  <label style={{ fontSize: 12.5, fontWeight: 700, color: '#5A5F55', display: 'block', marginBottom: 5 }}>كلمة المرور</label>
+                  <input value={userModal.data.password} onChange={e => setUserModal({ ...userModal, data: { ...userModal.data, password: e.target.value } })}
+                    style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid #DEDBD2', fontSize: 13.5 }} />
+                </div>
+
+                <button
+                  onClick={() => {
+                    if (!userModal.data.name || !userModal.data.code || !userModal.data.password) {
+                      setToast('الرجاء تعبئة كل الحقول المطلوبة');
+                      setTimeout(() => setToast(null), 2200);
+                      return;
+                    }
+                    if (userModal.mode === 'add') {
+                      setUserAccounts(prev => [...prev, { ...userModal.data, id: Date.now(), active: true }]);
+                      setToast('تم إضافة المستخدم بنجاح');
+                    } else {
+                      setUserAccounts(prev => prev.map(u => u.id === userModal.data.id ? { ...userModal.data } : u));
+                      setToast('تم حفظ التعديلات بنجاح');
+                    }
+                    setUserModal(null);
+                    setTimeout(() => setToast(null), 2200);
+                  }}
+                  style={{ width: '100%', padding: 12, borderRadius: 10, border: 'none', background: '#0F2C5C', color: '#fff', fontWeight: 800, fontSize: 14, marginTop: 6 }}>
+                  {userModal.mode === 'add' ? 'إضافة المستخدم' : 'حفظ التعديلات'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Admin/Deputy permit creation modal */}
+        {adminPermitModal && (
+          <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,44,92,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16, zIndex: 50 }}>
+            <div style={{ background: '#fff', borderRadius: 16, maxWidth: 400, width: '100%', maxHeight: '85vh', overflowY: 'auto', padding: 22 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+                <div style={{ fontWeight: 800, fontSize: 15, color: '#0F2C5C' }}>تسجيل استئذان جديد</div>
+                <button onClick={() => setAdminPermitModal(null)} style={{ border: 'none', background: 'none' }}><X size={18} /></button>
+              </div>
+
+              {adminPermitModal.step === 'pick' && (
+                <>
+                  <div style={{ fontSize: 12.5, fontWeight: 700, color: '#5A5F55', marginBottom: 8 }}>اختر الفصل</div>
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 16 }}>
+                    {CLASSES.map(c => (
+                      <button key={c} onClick={() => setAdminPermitModal({ ...adminPermitModal, className: c })}
+                        style={{ padding: '7px 12px', borderRadius: 8, border: c === adminPermitModal.className ? '2px solid #0F2C5C' : '1px solid #DEDBD2', background: c === adminPermitModal.className ? '#E8EFF9' : '#fff', color: c === adminPermitModal.className ? '#0F2C5C' : '#5A5F55', fontWeight: 700, fontSize: 12.5 }}>
+                        {c}
+                      </button>
+                    ))}
+                  </div>
+                  <div style={{ fontSize: 12.5, fontWeight: 700, color: '#5A5F55', marginBottom: 8 }}>اختر الطالب</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 240, overflowY: 'auto' }}>
+                    {STUDENT_NAMES.map(name => (
+                      <button key={name} onClick={() => setAdminPermitModal({ ...adminPermitModal, step: 'type', student: name })}
+                        style={{ textAlign: 'right', padding: 10, borderRadius: 8, border: '1px solid #E2DFD6', background: '#fff', fontSize: 13 }}>
+                        {name}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+
+              {adminPermitModal.step === 'type' && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <div style={{ fontSize: 12.5, color: '#8A8F84', marginBottom: 4 }}>{adminPermitModal.student} — {adminPermitModal.className}</div>
+                  {Object.entries(PERMIT_TYPES).map(([key, cfg]) => (
+                    <button key={key}
+                      onClick={() => key === 'exit'
+                        ? setAdminPermitModal({ ...adminPermitModal, step: 'reason', type: key })
+                        : createAdminPermit(adminPermitModal.student, adminPermitModal.className, key)}
+                      style={{ display: 'flex', alignItems: 'center', gap: 10, padding: 12, borderRadius: 10, border: '1px solid #E2DFD6', background: cfg.bg }}>
+                      <cfg.icon size={16} color={cfg.color} />
+                      <span style={{ fontWeight: 700, color: cfg.color, fontSize: 14 }}>{cfg.label}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {adminPermitModal.step === 'reason' && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <div style={{ fontSize: 12.5, color: '#8A8F84', marginBottom: 4 }}>اختر سبب الخروج من الفصل:</div>
+                  {EXIT_REASONS.map(r => (
+                    <button key={r} onClick={() => createAdminPermit(adminPermitModal.student, adminPermitModal.className, 'exit', r)}
+                      style={{ textAlign: 'right', padding: 11, borderRadius: 9, border: '1px solid #E2DFD6', background: '#FBF3E1', color: '#B8860B', fontWeight: 700, fontSize: 13.5 }}>
+                      {r}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {toast && (
+          <div style={{ position: 'fixed', bottom: 20, left: '50%', transform: 'translateX(-50%)', background: '#0F2C5C', color: '#fff', padding: '10px 20px', borderRadius: 10, fontSize: 13, fontWeight: 600, zIndex: 60 }}>{toast}</div>
+        )}
+      </div>
+    );
+  }
+
+  // ----------------- واجهة المعلم -----------------
+  return (
+    <div dir="rtl" style={{ fontFamily: "'Segoe UI', Tahoma, Arial, sans-serif", background: '#F7F5F1', minHeight: '100vh' }}>
+      <style>{`
+        * { box-sizing: border-box; }
+        button { font-family: inherit; cursor: pointer; }
+        .print-only { display: none; }
+        @media print {
+          .screen-only { display: none !important; }
+          .print-only { display: block !important; }
+          body { background: #fff !important; }
+        }
+      `}</style>
+      <header style={{ background: '#0F2C5C', color: '#fff', padding: '16px 20px', borderBottom: '3px solid #C9A227', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+        <div>
+          <div style={{ fontSize: 12, color: '#C9A227', fontWeight: 700 }}>مدرسة عزالدين بن الوزير</div>
+          <div style={{ fontSize: 16, fontWeight: 900 }}>{session.teacher.name} — {session.teacher.subject}</div>
+        </div>
+        <button onClick={() => setSession(null)} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '9px 14px', borderRadius: 9, border: 'none', background: 'rgba(255,255,255,0.15)', color: '#fff', fontWeight: 700, fontSize: 13 }}>
+          <LogOut size={15} /> خروج
+        </button>
+      </header>
+
+      <main style={{ maxWidth: 700, margin: '0 auto', padding: '20px 16px 60px' }}>
+        {/* اختيار الحصة والفصل */}
+        <div style={{ background: '#fff', borderRadius: 14, padding: 16, marginBottom: 16, border: '1px solid #EAE7DE' }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: '#5A5F55', marginBottom: 8 }}>اختر الحصة</div>
+          <div style={{ display: 'flex', gap: 6, overflowX: 'auto', paddingBottom: 6, marginBottom: 14 }}>
+            {PERIODS.map(p => (
+              <button key={p} onClick={() => setSelectedPeriod(p)} style={{ padding: '8px 14px', borderRadius: 8, border: p === selectedPeriod ? '2px solid #0F2C5C' : '1px solid #DEDBD2', background: p === selectedPeriod ? '#E8EFF9' : '#fff', color: p === selectedPeriod ? '#0F2C5C' : '#5A5F55', fontWeight: 700, fontSize: 13, whiteSpace: 'nowrap' }}>{p}</button>
+            ))}
+          </div>
+          <div style={{ fontSize: 13, fontWeight: 700, color: '#5A5F55', marginBottom: 8 }}>اختر الفصل</div>
+          <div style={{ display: 'flex', gap: 6, overflowX: 'auto', paddingBottom: 4 }}>
+            {CLASSES.map(c => (
+              <button key={c} onClick={() => { setSelectedClass(c); setRoster(makeRoster()); }} style={{ padding: '8px 14px', borderRadius: 8, border: c === selectedClass ? '2px solid #0F2C5C' : '1px solid #DEDBD2', background: c === selectedClass ? '#E8EFF9' : '#fff', color: c === selectedClass ? '#0F2C5C' : '#5A5F55', fontWeight: 700, fontSize: 13, whiteSpace: 'nowrap' }}>{c}</button>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+          <div style={{ fontSize: 14, fontWeight: 800, color: '#0F2C5C' }}>{selectedClass} — {selectedPeriod}</div>
+          <div style={{ fontSize: 12.5, color: '#5A5F55', fontWeight: 700 }}>تم تحضير {stats.marked}/{stats.total}</div>
+        </div>
+
+        <div style={{ background: '#fff', borderRadius: 14, border: '1px solid #EAE7DE', overflow: 'hidden', marginBottom: 16 }}>
+          {roster.map((s, i) => (
+            <div key={s.id} style={{ padding: '12px 16px', borderBottom: i !== roster.length - 1 ? '1px solid #F0EEE6' : 'none' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: s.notes.length ? 6 : 0 }}>
+                <div style={{ width: 28, height: 28, borderRadius: 8, background: '#F0EEE6', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 700, color: '#5A5F55', flexShrink: 0 }}>{s.number}</div>
+                <div style={{ flex: 1, fontWeight: 700, fontSize: 14 }}>{s.name}</div>
+                <button onClick={() => setStatus(s.id, 'present')} title="حاضر" style={{ width: 30, height: 30, borderRadius: 8, border: s.status === 'present' ? '2px solid #1E4E8C' : '1px solid #E2DFD6', background: s.status === 'present' ? '#E8EFF9' : '#fff', color: '#1E4E8C', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Check size={14} /></button>
+                <button onClick={() => setStatus(s.id, 'absent')} title="غائب" style={{ width: 30, height: 30, borderRadius: 8, border: s.status === 'absent' ? '2px solid #A33B3B' : '1px solid #E2DFD6', background: s.status === 'absent' ? '#FBEAEA' : '#fff', color: '#A33B3B', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><X size={14} /></button>
+                <button onClick={() => setNoteModal(s)} title="إضافة ملاحظة" style={{ padding: '0 10px', height: 30, borderRadius: 8, border: '1px solid #E2DFD6', background: '#fff', color: '#8A4B96', fontSize: 11.5, fontWeight: 700 }}>+ ملاحظة</button>
+                <button onClick={() => setPermitModal({ student: s, step: 'type' })} title="استئذان" style={{ padding: '0 10px', height: 30, borderRadius: 8, border: '1px solid #E2DFD6', background: '#fff', color: '#B8860B', fontSize: 11.5, fontWeight: 700 }}>استئذان</button>
+              </div>
+              {(s.status === 'absent' || s.notes.length > 0) && (
+                <div style={{ marginRight: 38, fontSize: 10.5, color: '#B0AFA6' }}>سيصل إشعار ولي الأمر عبر وكيل المرحلة</div>
+              )}
+              {s.notes.length > 0 && (
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginRight: 38 }}>
+                  {s.notes.map((n, ni) => {
+                    const cfg = NOTE_TYPES.find(x => x.key === n);
+                    return <span key={ni} style={{ fontSize: 11, background: cfg.bg, color: cfg.color, padding: '3px 8px', borderRadius: 6, fontWeight: 700 }}>{cfg.label}</span>;
+                  })}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+
+        <button style={{ width: '100%', padding: 14, borderRadius: 12, border: 'none', background: '#0F2C5C', color: '#fff', fontWeight: 800, fontSize: 15 }}>
+          حفظ تحضير {selectedPeriod}
+        </button>
+      </main>
+
+      {/* Note modal */}
+      {noteModal && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,44,92,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16, zIndex: 50 }}>
+          <div style={{ background: '#fff', borderRadius: 16, maxWidth: 380, width: '100%', padding: 20 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+              <div style={{ fontWeight: 800, fontSize: 15 }}>ملاحظة على {noteModal.name}</div>
+              <button onClick={() => setNoteModal(null)} style={{ border: 'none', background: 'none' }}><X size={18} /></button>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {NOTE_TYPES.map(n => (
+                <button key={n.key} onClick={() => addNote(noteModal.id, n.key)} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: 12, borderRadius: 10, border: '1px solid #E2DFD6', background: n.bg }}>
+                  <n.icon size={16} color={n.color} />
+                  <span style={{ fontWeight: 700, color: n.color, fontSize: 14 }}>{n.label}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Permit modal */}
+      {permitModal && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,44,92,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16, zIndex: 50 }}>
+          <div style={{ background: '#fff', borderRadius: 16, maxWidth: 380, width: '100%', padding: 20 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+              <div style={{ fontWeight: 800, fontSize: 15 }}>استئذان — {permitModal.student.name}</div>
+              <button onClick={() => setPermitModal(null)} style={{ border: 'none', background: 'none' }}><X size={18} /></button>
+            </div>
+
+            {permitModal.step === 'type' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {Object.entries(PERMIT_TYPES).map(([key, cfg]) => (
+                  <button key={key}
+                    onClick={() => key === 'exit' ? setPermitModal({ ...permitModal, step: 'reason', type: key }) : createPermit(permitModal.student, key)}
+                    style={{ display: 'flex', alignItems: 'center', gap: 10, padding: 12, borderRadius: 10, border: '1px solid #E2DFD6', background: cfg.bg }}>
+                    <cfg.icon size={16} color={cfg.color} />
+                    <span style={{ fontWeight: 700, color: cfg.color, fontSize: 14 }}>{cfg.label}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {permitModal.step === 'reason' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <div style={{ fontSize: 12.5, color: '#8A8F84', marginBottom: 4 }}>اختر سبب الخروج من الفصل:</div>
+                {EXIT_REASONS.map(r => (
+                  <button key={r} onClick={() => createPermit(permitModal.student, 'exit', r)}
+                    style={{ textAlign: 'right', padding: 11, borderRadius: 9, border: '1px solid #E2DFD6', background: '#FBF3E1', color: '#B8860B', fontWeight: 700, fontSize: 13.5 }}>
+                    {r}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {toast && (
+        <div style={{ position: 'fixed', bottom: 20, left: '50%', transform: 'translateX(-50%)', background: '#0F2C5C', color: '#fff', padding: '10px 20px', borderRadius: 10, fontSize: 13, fontWeight: 600 }}>{toast}</div>
+      )}
+    </div>
+  );
+}
+
+
+/* ========== نهاية كود التطبيق ========== */
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(TeacherApp));
+</script>
+
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js').catch(() => {});
+    });
+  }
+</script>
+</body>
+</html>
